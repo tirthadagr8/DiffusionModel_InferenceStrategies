@@ -1,0 +1,109 @@
+@video_pipeline.py
+1279-->1384
+
+        ## ADDITION
+        print("Scrubbing Transformer from memory...")
+        
+        # 1. Delete the object references so Python drops the link
+        if hasattr(self, "transformer"):
+            del self.transformer
+        if hasattr(self, "text_encoder"):
+            del self.text_encoder
+            
+        # 2. Force Garbage Collection to eat the "unreferenced" memory
+        import gc
+        for _ in range(3): 
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+        print(f"VRAM Cleared. Current usage: {torch.cuda.memory_allocated()/1024**3:.2f} GB.")
+        ##
+
+        if output_type == "latent":
+            video_frames = latents
+        else:
+            # [Standard Pre-processing]
+            if len(latents.shape) == 4:
+                latents = latents.unsqueeze(2)
+            elif len(latents.shape) != 5:
+                raise ValueError(f"Only support latents with shape (b, c, h, w) or (b, c, f, h, w), but got {latents.shape}.")
+
+            if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
+                latents = latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
+            else:
+                latents = latents / self.vae.config.scaling_factor
+
+            if enable_vae_tile_parallelism and hasattr(self.vae, 'enable_tile_parallelism'):
+                self.vae.enable_tile_parallelism()
+
+            # =========================================================
+            # [IMPROVED] GAPLESS SLICED VAE DECODE
+            # =========================================================
+            if return_pre_sr_video or not enable_sr:
+                with torch.autocast(device_type="cuda", dtype=self.vae_dtype, enabled=self.vae_autocast_enabled), \
+                     auto_offload_model(self.vae, self.execution_device, enabled=self.enable_offloading):
+                    
+                    self.vae.enable_tiling()
+                    
+                    # 4 Latents = 16 Video Frames. Very safe for VRAM.
+                    slice_size = 4  
+                    # 2 Latents = 8 Video Frames overlap context.
+                    overlap = 2     
+                    
+                    decoded_slices = []
+                    total_latents = latents.shape[2]
+                    
+                    print(f"Starting Safe VAE Decode. Total Latents: {total_latents}")
+
+                    for i in range(0, total_latents, slice_size):
+                        # 1. Strict Window Calculation
+                        # We want the "core" valid data to be from i to i+slice_size
+                        # We add overlap context AROUND that core.
+                        
+                        start_idx = max(0, i - overlap)
+                        end_idx = min(total_latents, i + slice_size + overlap)
+                        
+                        # current_slice_len will never exceed (slice_size + 2*overlap)
+                        # For slice=4, overlap=2, max width is 8 latents (32 frames).
+                        
+                        print(f"Processing Window: {start_idx} to {end_idx} (Size: {end_idx-start_idx})")
+                        
+                        # 2. Extract Slice
+                        latent_slice = latents[:, :, start_idx:end_idx, :, :]
+                        
+                        # 3. Decode
+                        decoded_output = self.vae.decode(latent_slice, return_dict=False, generator=generator)[0]
+                        
+                        # 4. Calculate Crop Indices (The "Core" Frames)
+                        # We need to find where the "i" index starts relative to our "start_idx" slice
+                        valid_start_latent_idx = i
+                        valid_end_latent_idx = min(i + slice_size, total_latents)
+                        
+                        # Convert to frame offsets relative to the decoded chunk
+                        # How many frames to skip at the beginning?
+                        frame_offset_start = (valid_start_latent_idx - start_idx) * 4
+                        
+                        # How many frames is our target core?
+                        target_frame_count = (valid_end_latent_idx - valid_start_latent_idx) * 4
+                        
+                        # 5. Extract & Move to CPU
+                        clean_slice = decoded_output[:, :, frame_offset_start : frame_offset_start + target_frame_count, :, :]
+                        decoded_slices.append(clean_slice.cpu())
+                        
+                        # 6. Aggressive Cleanup (Critical for OOM)
+                        del decoded_output, latent_slice, clean_slice
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                    self.vae.disable_tiling()
+                    
+                    if len(decoded_slices) > 0:
+                        video_frames = torch.cat(decoded_slices, dim=2)
+                    else:
+                        video_frames = None
+
+                if video_frames is not None:
+                    video_frames = video_frames.cpu()
+                    video_frames = (video_frames / 2 + 0.5).clamp(0, 1).float()
+            # =========================================================
